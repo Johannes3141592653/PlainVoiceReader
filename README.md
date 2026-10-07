@@ -1,0 +1,54 @@
+# Plain Voice Reader for Android
+
+A deliberately simple Android text-to-speech reader. It treats documents as paragraphs rather than trying to reproduce their visual page layout.
+
+## Version 0.1 features
+
+- EPUB 2/3 text extraction
+- PDF text extraction for PDFs that already contain selectable text
+- MOBI/PRC text extraction for unencrypted MOBI using no compression or PalmDOC compression
+- TXT/Markdown text files
+- Android system Text-to-Speech, no API key required
+- 0.5x to 2.5x speech rate
+- Play/pause, previous paragraph, next paragraph
+- Tap any paragraph to move the reading position
+- Current paragraph highlighting and automatic scrolling
+- Remembers the last paragraph for each file
+- Uses Android's Storage Access Framework, so no broad storage permission is requested
+
+## Known first-version limits
+
+- Scanned/image-only PDFs need OCR and are not readable yet.
+- DRM-protected books are not supported and the app does not attempt to bypass DRM.
+- MOBI HUFF/CDIC compression is not supported in v0.1. PalmDOC MOBI files are supported.
+- Pause stops the Android TTS utterance. Pressing Play again restarts the current paragraph rather than resuming mid-sentence.
+- Background/lock-screen media controls are not yet implemented.
+
+## Build an APK
+
+Open this folder in Android Studio. Recommended environment:
+
+- JDK 17 or newer
+- Android Studio with Android SDK 35 installed
+
+Let Gradle sync and download dependencies, then select:
+
+`Build > Build App Bundles or APKs > Build APKs`
+
+The debug APK will normally be created under:
+
+`app/build/outputs/apk/debug/app-debug.apk`
+
+Copy the APK to your Android phone, open it, and allow installation from that source if Android asks.
+
+## Why PDFBox is included
+
+Android does not provide a built-in API for extracting selectable text from arbitrary PDFs. This project uses PdfBox-Android for that job.
+
+## MOBI note
+
+The app contains a small text-only PalmDOC/MOBI parser. It is intentionally limited to the common unencrypted PalmDOC variants. It does not decrypt Kindle books.
+
+## Automatic APK build with GitHub
+
+A GitHub Actions workflow is included at `.github/workflows/build-apk.yml`. If the project is placed in a GitHub repository, every push to `main` can build a debug APK automatically. The APK is then available as a workflow artifact named `PlainVoiceReader-debug-apk`.
