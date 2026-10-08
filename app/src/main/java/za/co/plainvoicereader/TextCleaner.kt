@@ -3,6 +3,32 @@ package za.co.plainvoicereader
 object TextCleaner {
     private const val MAX_TTS_CHARS = 2600
 
+    /** Keep neural engines responsive without changing the paragraph shown in the reader. */
+    fun speechChunks(paragraph: String, maxChars: Int = 180): List<String> {
+        require(maxChars > 0)
+        val chunks = mutableListOf<String>()
+        val current = StringBuilder()
+        for (word in paragraph.trim().split(Regex("\\s+"))) {
+            if (word.isEmpty()) continue
+            if (current.isNotEmpty() && current.length + 1 + word.length > maxChars) {
+                chunks += current.toString()
+                current.clear()
+            }
+            if (word.length > maxChars) {
+                if (current.isNotEmpty()) {
+                    chunks += current.toString()
+                    current.clear()
+                }
+                word.chunked(maxChars).forEach { chunks += it }
+            } else {
+                if (current.isNotEmpty()) current.append(' ')
+                current.append(word)
+            }
+        }
+        if (current.isNotEmpty()) chunks += current.toString()
+        return chunks
+    }
+
     fun plainText(raw: String): List<String> {
         val normal = normalise(raw)
         val blocks = normal.split(Regex("\\n\\s*\\n+"))

@@ -87,6 +87,8 @@ private val nightColors = darkColorScheme(
     background = Color(0xFF101A1D), surface = Color(0xFF1B282A), surfaceVariant = Color(0xFF2D3A3A)
 )
 
+private data class VoiceOption(val voice: Voice, val name: String, val label: String, val quality: Int)
+
 class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private lateinit var tts: TextToSpeech
     private lateinit var store: LibraryStore
@@ -102,9 +104,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var screen by mutableStateOf("library")
     private var voiceReturnScreen = "library"
     private var selectedVoice by mutableStateOf("")
-    private var availableVoices by mutableStateOf<List<Voice>>(emptyList())
+    private var availableVoices by mutableStateOf<List<VoiceOption>>(emptyList())
     private var activeUtterance = ""
     private var utteranceNumber = 0L
+    private var speechChunks = emptyList<String>()
+    private var chunkIndex = 0
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -114,13 +118,31 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         selectedVoice = getPreferences(MODE_PRIVATE).getString("voice", "").orEmpty()
         tts = TextToSpeech(this, this)
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) = Unit
+            override fun onStart(utteranceId: String?) {
+                runOnUiThread {
+                    if (utteranceId == activeUtterance) status =
+                        if (utteranceId?.startsWith("test_") == true) "Voice test playing" else "Reading"
+                }
+            }
             override fun onError(utteranceId: String?) {
-                runOnUiThread { if (utteranceId == activeUtterance) { isPlaying = false; status = "The speech engine reported an error." } }
+                reportSpeechError(utteranceId, TextToSpeech.ERROR)
+            }
+            override fun onError(utteranceId: String?, errorCode: Int) {
+                reportSpeechError(utteranceId, errorCode)
             }
             override fun onDone(utteranceId: String?) {
                 runOnUiThread {
-                    if (!isPlaying || utteranceId != activeUtterance) return@runOnUiThread
+                    if (utteranceId != activeUtterance) return@runOnUiThread
+                    if (utteranceId?.startsWith("test_") == true) {
+                        status = "Voice test finished."
+                        return@runOnUiThread
+                    }
+                    if (!isPlaying) return@runOnUiThread
+                    if (chunkIndex + 1 < speechChunks.size) {
+                        chunkIndex++
+                        queueCurrentChunk()
+                        return@runOnUiThread
+                    }
                     val next = nextSpeakable(currentIndex + 1)
                     if (next < paragraphs.size) {
                         currentIndex = next
@@ -138,17 +160,27 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     override fun onInit(result: Int) {
-        if (result != TextToSpeech.SUCCESS) { status = "Android Text-to-Speech could not initialise."; return }
-        tts.language = Locale.getDefault()
-        availableVoices = tts.voices.orEmpty().filter { !it.isNetworkConnectionRequired }.sortedWith(compareBy({ it.locale.displayName }, { -it.quality }, { it.name }))
-        setVoice(selectedVoice)
-        tts.setSpeechRate(speed)
-        ttsReady = true
+        runOnUiThread {
+            if (result != TextToSpeech.SUCCESS) {
+                status = "Android Text-to-Speech could not initialise."
+                return@runOnUiThread
+            }
+            availableVoices = runCatching { tts.voices }.getOrNull().orEmpty().mapNotNull { voice ->
+                runCatching {
+                    if (voice.isNetworkConnectionRequired) return@runCatching null
+                    val name = voice.name?.takeIf { it.isNotBlank() } ?: return@runCatching null
+                    VoiceOption(voice, name, voice.locale?.displayName ?: "Unknown language", voice.quality)
+                }.getOrNull()
+            }.sortedWith(compareBy({ it.label }, { -it.quality }, { it.name }))
+            if (selectedVoice.isNotBlank()) setVoice(selectedVoice)
+            tts.setSpeechRate(speed)
+            ttsReady = true
+        }
     }
 
     private fun setVoice(name: String) {
-        val voice = availableVoices.find { it.name == name }
-        if (voice != null && tts.setVoice(voice) == TextToSpeech.SUCCESS) {
+        val option = availableVoices.find { it.name == name }
+        if (option != null && tts.setVoice(option.voice) == TextToSpeech.SUCCESS) {
             selectedVoice = name
             getPreferences(MODE_PRIVATE).edit().putString("voice", name).apply()
             activeBook?.let { updateBook(it.copy(voiceName = name)) }
@@ -156,6 +188,39 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         } else if (name.isNotBlank()) {
             selectedVoice = ""
             status = "That voice is unavailable on this device. Using the system default."
+        }
+    }
+
+    private fun useDefaultVoice() {
+        selectedVoice = ""
+        getPreferences(MODE_PRIVATE).edit().remove("voice").apply()
+        activeBook?.let { updateBook(it.copy(voiceName = "")) }
+        val default = tts.defaultVoice
+        if (default != null) tts.setVoice(default)
+        if (isPlaying) speakCurrent()
+    }
+
+    private fun reportSpeechError(utteranceId: String?, code: Int) {
+        runOnUiThread {
+            if (utteranceId != activeUtterance) return@runOnUiThread
+            isPlaying = false
+            status = when (code) {
+                TextToSpeech.ERROR_NOT_INSTALLED_YET -> "Voice model not installed. Download it in your speech engine."
+                TextToSpeech.ERROR_OUTPUT -> "Audio output failed. Check media volume and audio routing."
+                TextToSpeech.ERROR_NETWORK -> "Speech engine requested a network connection."
+                else -> "Speech engine error $code. Try a voice test in VoxSherpa."
+            }
+        }
+    }
+
+    private fun testVoice() {
+        if (!ttsReady) return
+        isPlaying = false
+        activeUtterance = "test_${++utteranceNumber}"
+        tts.setSpeechRate(1f)
+        status = "Starting voice test…"
+        if (tts.speak("Hello. This is a test of your selected voice.", TextToSpeech.QUEUE_FLUSH, null, activeUtterance) == TextToSpeech.ERROR) {
+            status = "The speech engine rejected the voice test."
         }
     }
 
@@ -292,14 +357,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             item {
                 Text("Installed voices", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
                 Text("Choose an offline voice already installed on this device. Voice quality depends on your Android speech engine.")
+                Text("Kokoro can take a few seconds to prepare a sentence. Piper is usually faster.", style = MaterialTheme.typography.bodySmall)
                 Spacer(Modifier.height(8.dp))
-                OutlinedButton(onClick = { selectedVoice = ""; getPreferences(MODE_PRIVATE).edit().remove("voice").apply(); activeBook?.let { updateBook(it.copy(voiceName = "")) }; tts.language = Locale.getDefault(); if (isPlaying) speakCurrent() }) { Text(if (selectedVoice.isEmpty()) "✓ System default" else "System default") }
+                OutlinedButton(onClick = { useDefaultVoice() }) { Text(if (selectedVoice.isEmpty()) "✓ System default" else "System default") }
+                Button(onClick = { testVoice() }, enabled = ttsReady) { Text("Test voice") }
+                Text(status, style = MaterialTheme.typography.bodySmall)
             }
-            items(availableVoices, key = { it.name }) { voice ->
-                Card(Modifier.fillMaxWidth().clickable { setVoice(voice.name) }) {
+            itemsIndexed(availableVoices) { _, option ->
+                Card(Modifier.fillMaxWidth().clickable { setVoice(option.name) }) {
                     Column(Modifier.padding(14.dp)) {
-                        Text("${if (selectedVoice == voice.name) "✓ " else ""}${voice.locale.displayName} · ${voice.name}", style = MaterialTheme.typography.titleSmall)
-                        Text("Offline · ${if (voice.quality >= Voice.QUALITY_HIGH) "High quality" else "Standard quality"}", style = MaterialTheme.typography.bodySmall)
+                        Text("${if (selectedVoice == option.name) "✓ " else ""}${option.label} · ${option.name}", style = MaterialTheme.typography.titleSmall)
+                        Text("Offline · ${if (option.quality >= Voice.QUALITY_HIGH) "High quality" else "Standard quality"}", style = MaterialTheme.typography.bodySmall)
                     }
                 }
             }
@@ -381,12 +449,17 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         if (index >= paragraphs.size) { isPlaying = false; status = "Finished."; return }
         currentIndex = index
         savePosition()
+        speechChunks = TextCleaner.speechChunks(paragraphs[index])
+        chunkIndex = 0
+        queueCurrentChunk()
+    }
+    private fun queueCurrentChunk() {
+        if (chunkIndex !in speechChunks.indices) { isPlaying = false; return }
         activeUtterance = "p_${++utteranceNumber}"
-        tts.stop()
         tts.setSpeechRate(speed)
-        status = "Reading"
-        if (tts.speak(paragraphs[index], TextToSpeech.QUEUE_FLUSH, null, activeUtterance) == TextToSpeech.ERROR) {
-            isPlaying = false; status = "Could not start speech."
+        status = "Starting speech…"
+        if (tts.speak(speechChunks[chunkIndex], TextToSpeech.QUEUE_FLUSH, null, activeUtterance) == TextToSpeech.ERROR) {
+            isPlaying = false; status = "The speech engine rejected this text."
         }
     }
     override fun onDestroy() { if (::tts.isInitialized) { tts.stop(); tts.shutdown() }; super.onDestroy() }

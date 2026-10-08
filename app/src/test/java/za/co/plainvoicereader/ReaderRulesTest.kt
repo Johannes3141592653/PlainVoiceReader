@@ -1,12 +1,20 @@
 package za.co.plainvoicereader
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
 class ReaderRulesTest {
+    @Test fun speechIsChunkedWithoutChangingParagraphText() {
+        val paragraph = "A paragraph with several sentences. The next sentence needs a little more time to say."
+        val chunks = TextCleaner.speechChunks(paragraph, maxChars = 32)
+        assertEquals(paragraph, chunks.joinToString(" "))
+        assertTrue(chunks.size > 1 && chunks.all { it.length <= 32 })
+    }
+
     @Test fun progressTracksSavedParagraph() {
         val book = LibraryBook("id", "book.epub", "Book", position = 3, paragraphCount = 7)
         assertEquals(50, book.progress)
