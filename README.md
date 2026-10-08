@@ -52,3 +52,9 @@ The app contains a small text-only PalmDOC/MOBI parser. It is intentionally limi
 ## Automatic APK build with GitHub
 
 A GitHub Actions workflow is included at `.github/workflows/build-apk.yml`. If the project is placed in a GitHub repository, every push to `main` can build a debug APK automatically. The APK is then available as a workflow artifact named `PlainVoiceReader-debug-apk`.
+
+## Library and voices
+
+Add Book copies each supported document into the app's private storage, so moving or deleting the original does not break the library. The home screen shows the most recently read book, progress, last-read date, and EPUB cover/title/author when present. The reader supports section jumps, bookmarks, and speed steps of 0.05× from 1× to 3×. EPUB headings and repeated PDF margin headers or page numbers are skipped during speech. PDF section detection is heuristic and depends on the source text.
+
+The Voice screen lists offline voices exposed by the installed Android text-to-speech engine. Available voices and their quality vary by device. For free offline neural speech on Android 11+, [VoxSherpa TTS](https://github.com/CodeBySonu95/VoxSherpa-TTS) is a GPLv3 Android speech engine that offers Kokoro and Piper models. Install it, download a Kokoro model there, select VoxSherpa as the default Android speech engine, and reopen this app to choose one of its voices. Kokoro model weights are Apache-licensed. This app does not bundle a model, and voice quality and speed depend on the phone. Background media controls are not yet provided.

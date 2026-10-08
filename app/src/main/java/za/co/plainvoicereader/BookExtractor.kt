@@ -11,111 +11,121 @@ import java.io.ByteArrayOutputStream
 import java.net.URLDecoder
 import java.util.zip.ZipInputStream
 
+data class Chapter(val title: String, val index: Int)
+data class ReadableBook(val paragraphs: List<String>, val chapters: List<Chapter> = emptyList(), val title: String = "", val author: String = "", val cover: ByteArray? = null)
+
 object BookExtractor {
-    fun extract(context: Context, uri: Uri, displayName: String): List<String> {
-        val ext = displayName.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            "txt", "text", "md" -> extractText(context, uri)
-            "pdf" -> extractPdf(context, uri)
-            "epub" -> extractEpub(context, uri)
-            "mobi", "prc" -> extractMobi(context, uri)
-            else -> throw IllegalArgumentException("Unsupported file type .$ext. Use EPUB, MOBI, PRC, PDF, or TXT.")
-        }.also {
-            require(it.isNotEmpty()) { "No readable text was found in this file." }
+    fun extract(context: Context, uri: Uri, displayName: String): ReadableBook {
+        val result = when (displayName.substringAfterLast('.', "").lowercase()) {
+            "txt", "text", "md" -> text(context, uri)
+            "pdf" -> pdf(context, uri)
+            "epub" -> epub(context, uri)
+            "mobi", "prc" -> MobiTextExtractor.extract(read(context, uri)).let { ReadableBook(it, detectHeadings(it)) }
+            else -> error("Unsupported file type. Use EPUB, MOBI, PRC, PDF, or TXT.")
         }
+        require(result.paragraphs.isNotEmpty()) { "No readable text was found in this file." }
+        return result
     }
 
-    private fun extractText(context: Context, uri: Uri): List<String> {
-        val raw = context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-            ?: error("Could not open the text file.")
-        return TextCleaner.plainText(raw)
+    private fun read(context: Context, uri: Uri): ByteArray = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: error("Could not open the file.")
+
+    private fun text(context: Context, uri: Uri): ReadableBook {
+        val blocks = TextCleaner.plainText(read(context, uri).toString(Charsets.UTF_8))
+        return ReadableBook(blocks, detectHeadings(blocks))
     }
 
-    private fun extractPdf(context: Context, uri: Uri): List<String> {
+    private fun pdf(context: Context, uri: Uri): ReadableBook {
         PDFBoxResourceLoader.init(context.applicationContext)
-        val input = context.contentResolver.openInputStream(uri) ?: error("Could not open the PDF.")
-        input.use { stream ->
-            PDDocument.load(stream).use { document ->
-                val raw = PDFTextStripper().getText(document)
-                return TextCleaner.pdfText(raw)
-            }
-        }
-    }
-
-    private fun extractMobi(context: Context, uri: Uri): List<String> {
-        val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-            ?: error("Could not open the MOBI file.")
-        return MobiTextExtractor.extract(bytes)
-    }
-
-    private fun extractEpub(context: Context, uri: Uri): List<String> {
-        val entries = linkedMapOf<String, ByteArray>()
-        val input = context.contentResolver.openInputStream(uri) ?: error("Could not open the EPUB.")
-        ZipInputStream(input).use { zip ->
-            while (true) {
-                val entry = zip.nextEntry ?: break
-                if (!entry.isDirectory) {
-                    val out = ByteArrayOutputStream()
-                    zip.copyTo(out)
-                    entries[normalisePath(entry.name)] = out.toByteArray()
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            PDDocument.load(stream).use { doc ->
+                val stripper = PDFTextStripper()
+                val pages = (1..doc.numberOfPages).map { page ->
+                    stripper.startPage = page; stripper.endPage = page
+                    stripper.getText(doc).lines().map { it.trim() }.filter { it.isNotBlank() }
                 }
-                zip.closeEntry()
+                // Only suppress recurring margin text, seen on at least two pages.
+                val margins = pages.flatMap { lines -> lines.take(2) + lines.takeLast(2) }
+                    .filter { it.length in 4..90 && !it.matches(Regex("\\d+")) }
+                    .groupingBy { it.lowercase() }.eachCount().filterValues { it >= 2 }.keys
+                val cleaned = pages.map { lines ->
+                    lines.filterIndexed { i, line ->
+                        !((i < 2 || i >= lines.size - 2) && (line.lowercase() in margins || line.matches(Regex("(?:page\\s*)?\\d{1,4}", RegexOption.IGNORE_CASE))))
+                    }.joinToString("\n")
+                }.joinToString("\n\n")
+                val blocks = TextCleaner.pdfText(cleaned)
+                return ReadableBook(blocks, detectHeadings(blocks), doc.documentInformation.title.orEmpty(), doc.documentInformation.author.orEmpty())
+            }
+        } ?: error("Could not open the PDF.")
+    }
+
+    private fun epub(context: Context, uri: Uri): ReadableBook = parseEpub(read(context, uri))
+
+    internal fun parseEpub(bytes: ByteArray): ReadableBook {
+        val entries = linkedMapOf<String, ByteArray>()
+        java.io.ByteArrayInputStream(bytes).let { stream ->
+            ZipInputStream(stream).use { zip ->
+                while (true) {
+                    val entry = zip.nextEntry ?: break
+                    if (!entry.isDirectory) {
+                        val out = ByteArrayOutputStream()
+                        zip.copyTo(out)
+                        entries[normalisePath(entry.name)] = out.toByteArray()
+                    }
+                    zip.closeEntry()
+                }
             }
         }
-
-        val containerBytes = entries["META-INF/container.xml"]
-            ?: error("Invalid EPUB: META-INF/container.xml is missing.")
-        val container = Jsoup.parse(containerBytes.toString(Charsets.UTF_8), "", Parser.xmlParser())
-        val rootPath = container.selectFirst("rootfile")?.attr("full-path")
-            ?: error("Invalid EPUB: package document not found.")
-        val opfBytes = entries[normalisePath(rootPath)] ?: error("Invalid EPUB: $rootPath is missing.")
-        val opf = Jsoup.parse(opfBytes.toString(Charsets.UTF_8), "", Parser.xmlParser())
-
-        val manifest = mutableMapOf<String, String>()
-        opf.select("manifest item").forEach { item ->
-            val id = item.attr("id")
-            val href = item.attr("href")
-            if (id.isNotBlank() && href.isNotBlank()) manifest[id] = href
-        }
-
+        val container = Jsoup.parse(entries["META-INF/container.xml"]?.toString(Charsets.UTF_8) ?: error("Invalid EPUB container."), "", Parser.xmlParser())
+        val rootPath = container.selectFirst("rootfile")?.attr("full-path") ?: error("Invalid EPUB package document.")
+        val opf = Jsoup.parse(entries[normalisePath(rootPath)]?.toString(Charsets.UTF_8) ?: error("Missing EPUB package document."), "", Parser.xmlParser())
         val base = rootPath.substringBeforeLast('/', "")
-        val orderedPaths = opf.select("spine itemref")
-            .mapNotNull { manifest[it.attr("idref")] }
-            .map { resolve(base, it) }
-
-        val paths = if (orderedPaths.isNotEmpty()) orderedPaths else entries.keys
-            .filter { it.endsWith(".xhtml", true) || it.endsWith(".html", true) || it.endsWith(".htm", true) }
-            .sorted()
-
-        val blocks = mutableListOf<String>()
+        val manifest = opf.select("manifest item").associateBy { it.attr("id") }
+        val spine = opf.select("spine itemref").mapNotNull { manifest[it.attr("idref")]?.attr("href") }.map { resolve(base, it) }
+        val paths = spine.ifEmpty { entries.keys.filter { it.endsWith(".xhtml", true) || it.endsWith(".html", true) }.sorted() }
+        val paragraphs = mutableListOf<String>()
+        val chapters = mutableListOf<Chapter>()
         for (path in paths) {
-            val bytes = entries[path] ?: continue
-            val html = bytes.toString(Charsets.UTF_8)
+            val html = entries[path]?.toString(Charsets.UTF_8) ?: continue
             val doc = Jsoup.parse(html)
             val selected = doc.select("h1,h2,h3,h4,h5,h6,p,li,blockquote")
-            if (selected.isNotEmpty()) {
-                selected.mapTo(blocks) { it.text() }
-            } else if (doc.text().isNotBlank()) {
-                blocks += doc.text()
+            if (selected.isEmpty() && doc.text().isNotBlank()) paragraphs += TextCleaner.htmlBlocks(listOf(doc.text()))
+            selected.forEach { element ->
+                // Container blocks with their own paragraphs would speak the same text twice.
+                if (element.tagName() in setOf("li", "blockquote") && element.selectFirst("p,li,blockquote") != null) return@forEach
+                val value = TextCleaner.htmlBlocks(listOf(element.text()))
+                if (value.isNotEmpty()) {
+                    if (element.tagName().matches(Regex("h[1-6]"))) chapters += Chapter(value.first(), paragraphs.size)
+                    paragraphs += value
+                }
             }
         }
-        return TextCleaner.htmlBlocks(blocks)
+        val coverId = opf.selectFirst("metadata meta[name=cover]")?.attr("content")
+        val coverItem = opf.selectFirst("manifest item[properties~=cover-image]")
+            ?: coverId?.let { manifest[it] }
+            ?: opf.selectFirst("manifest item[id=cover]")
+            ?: opf.selectFirst("manifest item[id=cover-image]")
+        val cover = coverItem?.attr("href")?.let { entries[resolve(base, it)] }?.takeIf { it.size <= 5_000_000 }
+        val metadata = opf.selectFirst("metadata")
+        fun metaValue(localName: String): String = metadata?.children()?.firstOrNull {
+            it.tagName().substringAfter(':').equals(localName, ignoreCase = true)
+        }?.text().orEmpty()
+        return ReadableBook(paragraphs, chapters.distinctBy { it.index }, metaValue("title"), metaValue("creator"), cover)
+    }
+
+    private fun detectHeadings(blocks: List<String>): List<Chapter> = blocks.mapIndexedNotNull { index, block ->
+        if (block.length <= 90 && (block.matches(Regex("(?i)(chapter|part|book|section)\\s+[\\wIVXLC]+.*")) || (block.length < 55 && block == block.uppercase() && block.any { it.isLetter() }))) Chapter(block, index) else null
     }
 
     private fun resolve(base: String, href: String): String {
-        val cleanHref = href.substringBefore('#')
-        val decoded = try { URLDecoder.decode(cleanHref, "UTF-8") } catch (_: Exception) { cleanHref }
+        val clean = href.substringBefore('#')
+        val decoded = try { URLDecoder.decode(clean, "UTF-8") } catch (_: Exception) { clean }
         return normalisePath(if (base.isBlank()) decoded else "$base/$decoded")
     }
 
     private fun normalisePath(path: String): String {
         val parts = mutableListOf<String>()
         path.replace('\\', '/').split('/').forEach { part ->
-            when (part) {
-                "", "." -> Unit
-                ".." -> if (parts.isNotEmpty()) parts.removeAt(parts.lastIndex)
-                else -> parts += part
-            }
+            when (part) { "", "." -> Unit; ".." -> if (parts.isNotEmpty()) parts.removeAt(parts.lastIndex); else -> parts += part }
         }
         return parts.joinToString("/")
     }
